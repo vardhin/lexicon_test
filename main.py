@@ -1,137 +1,91 @@
-import argparse
+import asyncio
 import json
-import sys
 
-# Import tools to trigger registration
+import httpx
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
 import tools.calculator  # noqa: F401
 import tools.string_utils  # noqa: F401
 import tools.search  # noqa: F401
 
-from tools import get_all_tools
-from utils.llama_cpp import get_models
-from strategies.c_style import CStyleStrategy
-from strategies.json_style import JsonStyleStrategy
+from tools import get_all_tools, execute_tool
 from strategies.minimal_style import MinimalStyleStrategy
-from benchmark.cases import DEFAULT_CASES
-from benchmark.runner import run_experiment, save_result
-from benchmark.metrics import compare
+
+LLAMA_URL = "http://localhost:8080/v1/chat/completions"
+MODEL_ID = "unsloth/gemma-4-E4B-it-GGUF:Q4_K_S"
+
+app = FastAPI()
+strategy = MinimalStyleStrategy()
 
 
-STRATEGIES = {
-    "c_style": CStyleStrategy,
-    "json_style": JsonStyleStrategy,
-    "minimal_style": MinimalStyleStrategy,
-}
+class ChatRequest(BaseModel):
+    prompt: str
+    model: str = MODEL_ID
 
 
-def cmd_list_tools(args):
+@app.post("/chat")
+async def chat(req: ChatRequest):
     tools = get_all_tools()
-    if not tools:
-        print("No tools registered.")
-        return
-    for name, spec in tools.items():
-        fields = spec.param_model.model_fields
-        params = ", ".join(f"{k}: {v.annotation.__name__ if hasattr(v.annotation, '__name__') else v.annotation}" for k, v in fields.items())
-        print(f"  {name}({params}) -> {spec.return_type}")
-        print(f"    {spec.description}")
-        print()
+    system_prompt = strategy.build_system_prompt(tools)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": req.prompt},
+    ]
+
+    return StreamingResponse(
+        _stream(req.model, messages, tools),
+        media_type="text/event-stream",
+    )
 
 
-def cmd_list_models(args):
-    try:
-        models = get_models()
-        print("Available models:")
-        for m in models:
-            print(f"  - {m}")
-    except Exception as e:
-        print(f"Error connecting to llama.cpp server: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
-def cmd_run(args):
-    model_id = args.model
-    strategies_to_run = []
-
-    if args.strategy == "both":
-        strategies_to_run = [CStyleStrategy(), JsonStyleStrategy(), MinimalStyleStrategy()]
-    else:
-        strategies_to_run = [STRATEGIES[args.strategy]()]
-
-    results = []
-    for strategy in strategies_to_run:
-        print(f"\n{'='*65}")
-        print(f"Running: {strategy.name} | Model: {model_id} | Runs/case: {args.runs}")
-        print(f"{'='*65}")
-
-        result = run_experiment(model_id, strategy, DEFAULT_CASES, runs_per_case=args.runs)
-        path = save_result(result)
-        results.append(result)
-
-        print(f"\nResults saved to: {path}")
-        print(f"  E2E Accuracy: {result.end_to_end_accuracy:.1%}")
-        print(f"  Avg Tokens:   {result.avg_prompt_tokens:.0f} prompt + {result.avg_completion_tokens:.0f} completion")
-        print(f"  Avg Latency:  {result.avg_latency_ms:.0f}ms")
-
-    if len(results) == 2:
-        print(f"\n{'='*65}")
-        print("COMPARISON")
-        print(f"{'='*65}")
-        print(compare(results[0], results[1]))
-
-
-def cmd_compare(args):
-    results = []
-    for path in args.files:
-        with open(path) as f:
-            data = json.load(f)
-        from benchmark.metrics import ExperimentResult, RunResult
-        er = ExperimentResult(model_id=data["model_id"], strategy=data["strategy"])
-        for r in data["runs"]:
-            er.runs.append(RunResult(**{k: v for k, v in r.items()}))
-        results.append(er)
-
-    if len(results) != 2:
-        print("Provide exactly 2 result files to compare.", file=sys.stderr)
-        sys.exit(1)
-
-    print(compare(results[0], results[1]))
-
-
-def cmd_show_prompt(args):
-    strategy = STRATEGIES[args.strategy]()
-    tools = get_all_tools()
-    print(strategy.build_system_prompt(tools))
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Tool-calling strategy benchmark for local LLMs")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    sub.add_parser("list-tools", help="List registered tools")
-    sub.add_parser("list-models", help="List models from llama.cpp server")
-
-    run_p = sub.add_parser("run", help="Run benchmark experiment")
-    run_p.add_argument("--model", required=True, help="Model ID from llama.cpp server")
-    run_p.add_argument("--strategy", choices=["c_style", "json_style", "minimal_style", "both"], default="both")
-    run_p.add_argument("--runs", type=int, default=3, help="Runs per test case (default: 3)")
-
-    cmp_p = sub.add_parser("compare", help="Compare two result files")
-    cmp_p.add_argument("files", nargs=2, help="Two JSON result files to compare")
-
-    prompt_p = sub.add_parser("show-prompt", help="Show the system prompt for a strategy")
-    prompt_p.add_argument("--strategy", choices=["c_style", "json_style", "minimal_style"], required=True)
-
-    args = parser.parse_args()
-
-    commands = {
-        "list-tools": cmd_list_tools,
-        "list-models": cmd_list_models,
-        "run": cmd_run,
-        "compare": cmd_compare,
-        "show-prompt": cmd_show_prompt,
+async def _stream(model: str, messages: list[dict], tools: dict):
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "temperature": 0.0,
+        "max_tokens": 512,
     }
-    commands[args.command](args)
 
+    raw_chunks = []
 
-if __name__ == "__main__":
-    main()
+    async with httpx.AsyncClient(timeout=60) as client:
+        async with client.stream("POST", LLAMA_URL, json=payload) as resp:
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                token = delta.get("content", "")
+                if token:
+                    raw_chunks.append(token)
+
+    # Decide after full response whether it's a tool call or plain text
+    raw = "".join(raw_chunks)
+    parsed = strategy.parse_response(raw, tools)
+
+    if parsed is None:
+        # Plain text — stream tokens now
+        for token in raw_chunks:
+            yield f"data: {json.dumps({'token': token})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'type': 'text'})}\n\n"
+        return
+
+    func_name, kwargs = parsed
+    yield f"data: {json.dumps({'tool_call': func_name, 'args': kwargs})}\n\n"
+
+    try:
+        result = await asyncio.to_thread(execute_tool, func_name, kwargs)
+        yield f"data: {json.dumps({'tool_result': str(result), 'done': True, 'type': 'tool'})}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
