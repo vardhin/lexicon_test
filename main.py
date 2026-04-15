@@ -132,3 +132,9 @@ async def _stream(model: str, messages: list[dict], tools: dict):
 
     # Hit the step limit without a final answer
     yield f"data: {json.dumps({'error': 'Tool step limit reached', 'done': True})}\n\n"
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
