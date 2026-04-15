@@ -32,27 +32,49 @@ class MinimalStyleStrategy:
 
         tool_block = "\n".join(lines)
         return (
+            "You are Rhea, a helpful personal assistant running on the user's own Linux PC.\n"
+            "You have full access to their system through the shell tool.\n\n"
             f"Tools:\n{tool_block}\n\n"
-            "Always use a tool when the task requires computation, string manipulation, or search.\n"
-            "To call a tool write: CALL name(\"arg1\", arg2)\n"
-            "String args use double quotes. Numeric args are unquoted.\n"
-            "If no tool is needed, reply normally."
+            "Format:\n"
+            "Whenever you want to use a tool, you MUST write:\n"
+            "THINK: <one sentence: what you just learned and what you will do next>\n"
+            "CALL name(\"arg1\", arg2)\n\n"
+            "Rules:\n"
+            "- Always reason in THINK before each CALL. Never skip THINK.\n"
+            "- After a tool result, write another THINK line before your next CALL.\n"
+            "- ALWAYS use a tool when the task involves the file system, running processes, "
+            "installed software, searching files, or anything about the user's computer.\n"
+            "- Never ask the user for information you can discover yourself with a tool.\n"
+            "- Never give up after a failed tool result — think about why it failed and try differently.\n"
+            "- Never offer options or ask what to do next — decide and act.\n"
+            "- If no tool is needed, reply normally without THINK or CALL."
         )
 
-    def parse_response(self, raw: str, tools: dict[str, ToolSpec]) -> tuple[str, dict[str, Any]] | None:
-        for line in raw.splitlines():
+    def parse_response(self, raw: str, tools: dict[str, ToolSpec]) -> tuple[str, str, dict[str, Any]] | None:
+        """Returns (thought, func_name, kwargs) or None if no tool call found."""
+        thought = ""
+        lines = raw.splitlines()
+        for line in lines:
             stripped = line.strip()
-            # Handle "CALL name(...)" and "CALL: name(...)"
+
+            if stripped.upper().startswith("THINK:"):
+                thought = stripped[6:].strip()
+                continue
+
+            call_str = None
             if stripped.upper().startswith("CALL"):
                 call_str = stripped[4:].lstrip(":= ").strip()
-                if call_str:
-                    return _parse_call(call_str, tools)
-            # Handle model-native "<|tool_call>call:name(...)"
-            if "<|tool_call>" in stripped:
+            elif "<|tool_call>" in stripped:
                 after = stripped.split("<|tool_call>", 1)[1]
                 call_str = after.lstrip("call:Call: ").strip()
-                if call_str:
-                    return _parse_call(call_str, tools)
+
+            if call_str:
+                try:
+                    func_name, kwargs = _parse_call(call_str, tools)
+                    return thought, func_name, kwargs
+                except ParseError:
+                    continue
+
         return None
 
 
