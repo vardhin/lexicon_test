@@ -114,7 +114,7 @@ def _stream_assistant(prompt: str, session_id: str) -> None:
         method="POST",
     )
 
-    _write(f"{c(BOLD)}{c(GREEN)}rhea{c(RESET)} ")
+    _write(f"\n{c(BOLD)}{c(GREEN)}rhea{c(RESET)}\n")
 
     cursor = BlinkingCursor()
     cursor.start()
@@ -195,7 +195,11 @@ def _stream_assistant(prompt: str, session_id: str) -> None:
 
 
 def _read_prompt() -> str | None:
-    prompt_marker = f"{c(BOLD)}{c(MAGENTA)}❯{c(RESET)} " if COLOR else "> "
+    # readline miscounts prompt width if ANSI escapes aren't bracketed with \001..\002
+    if COLOR:
+        prompt_marker = f"\001{BOLD}{MAGENTA}\002❯\001{RESET}\002 "
+    else:
+        prompt_marker = "> "
     try:
         return input(prompt_marker)
     except EOFError:
@@ -216,7 +220,6 @@ def main() -> None:
     if initial:
         _write(f"{c(BOLD)}{c(CYAN)}you{c(RESET)} {c(CYAN)}{initial}{c(RESET)}\n")
         _stream_assistant(initial, session_id)
-        _write("\n")
 
     while True:
         try:
@@ -237,7 +240,6 @@ def main() -> None:
             return
 
         _stream_assistant(prompt, session_id)
-        _write("\n")
 
 
 if __name__ == "__main__":
