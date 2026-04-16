@@ -1,0 +1,14 @@
+[Unit]
+Description=Rhea Graph Memory Daemon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/vardhin/Documents/git/tool_test
+ExecStart=/home/vardhin/Documents/git/tool_test/.venv/bin/python -m tools.graph_memory_daemon --daemon
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

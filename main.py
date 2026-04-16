@@ -17,6 +17,7 @@ import tools.memory  # noqa: F401
 import tools.image_search  # noqa: F401
 
 from tools import get_all_tools, execute_tool
+from tools.memory import auto_memory_ingest, build_memory_context, ensure_memory_daemon
 from strategies.minimal_style import MinimalStyleStrategy
 
 LLAMA_URL = "http://localhost:8080/v1/chat/completions"
@@ -26,6 +27,34 @@ KEEPALIVE_INTERVAL = 4 * 60  # seconds between pings (must be < llama.cpp idle t
 
 app = FastAPI()
 strategy = MinimalStyleStrategy()
+
+MAX_CONVERSATION_TURNS = 3
+_SESSION_HISTORY: dict[str, list[dict[str, str]]] = {}
+
+
+def _get_session_key(session_id: str | None) -> str:
+    if session_id and session_id.strip():
+        return session_id.strip()
+    return "default"
+
+
+def _get_session_history(session_key: str) -> list[dict[str, str]]:
+    return list(_SESSION_HISTORY.get(session_key, []))
+
+
+def _save_turn(session_key: str, user_prompt: str, assistant_reply: str) -> None:
+    if not user_prompt.strip() and not assistant_reply.strip():
+        return
+
+    history = _SESSION_HISTORY.get(session_key, [])
+    history.append({"role": "user", "content": user_prompt})
+    history.append({"role": "assistant", "content": assistant_reply})
+
+    max_messages = MAX_CONVERSATION_TURNS * 2
+    if len(history) > max_messages:
+        history = history[-max_messages:]
+
+    _SESSION_HISTORY[session_key] = history
 
 
 async def _keepalive_loop():
@@ -47,25 +76,36 @@ async def _keepalive_loop():
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(_keepalive_loop())
+    await asyncio.to_thread(ensure_memory_daemon)
 
 
 class ChatRequest(BaseModel):
     prompt: str
     model: str = MODEL_ID
+    session_id: str | None = None
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    session_key = _get_session_key(req.session_id)
+    prior_history = _get_session_history(session_key)
+
+    memory_context = await asyncio.to_thread(build_memory_context, req.prompt)
+    memory_block = memory_context if memory_context else "(none)"
+    await asyncio.to_thread(auto_memory_ingest, req.prompt)
+
     tools = get_all_tools()
     system_prompt = strategy.build_system_prompt(tools)
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": req.prompt},
-    ]
+    messages = [{"role": "system", "content": system_prompt}]
+
+    messages.append({"role": "system", "content": f"MEMORY: {memory_block}"})
+    messages.extend(prior_history)
+
+    messages.append({"role": "user", "content": req.prompt})
 
     return StreamingResponse(
-        _stream(req.model, messages, tools),
+        _stream(req.model, messages, tools, session_key, req.prompt),
         media_type="text/event-stream",
     )
 
@@ -100,13 +140,21 @@ async def _llm_call(client: httpx.AsyncClient, model: str, messages: list[dict])
     return "".join(chunks), chunks
 
 
-async def _stream(model: str, messages: list[dict], tools: dict):
+async def _stream(
+    model: str,
+    messages: list[dict],
+    tools: dict,
+    session_key: str,
+    initial_user_prompt: str,
+):
     async with httpx.AsyncClient(timeout=60) as client:
         for step in range(MAX_TOOL_STEPS):
             raw, chunks = await _llm_call(client, model, messages)
+            await asyncio.to_thread(auto_memory_ingest, raw)
             parsed = strategy.parse_response(raw, tools)
 
             if parsed is None:
+                _save_turn(session_key, initial_user_prompt, raw)
                 # Final plain-text answer — stream it out token by token
                 for token in chunks:
                     yield f"data: {json.dumps({'token': token})}\n\n"
@@ -124,6 +172,8 @@ async def _stream(model: str, messages: list[dict], tools: dict):
             except Exception as e:
                 result_str = f"ERROR: {e}"
 
+            await asyncio.to_thread(auto_memory_ingest, result_str)
+
             yield f"data: {json.dumps({'tool_result': result_str, 'step': step})}\n\n"
 
             # Append the exchange to the message history so the model can reason over it
@@ -131,6 +181,7 @@ async def _stream(model: str, messages: list[dict], tools: dict):
             messages.append({"role": "user", "content": f"Tool result: {result_str}"})
 
     # Hit the step limit without a final answer
+    _save_turn(session_key, initial_user_prompt, "Tool step limit reached")
     yield f"data: {json.dumps({'error': 'Tool step limit reached', 'done': True})}\n\n"
 
 

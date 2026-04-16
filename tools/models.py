@@ -44,6 +44,22 @@ class MemorySetArgs(BaseModel):
     value: str = Field(description="Value to store")
 
 
+class MemoryQueryArgs(BaseModel):
+    query: str = Field(description="Keyword, phrase, or free-form text to search in memory")
+    top_k: int = Field(default=5, description="How many top-ranked items to return per level")
+
+
+class MemoryClearArgs(BaseModel):
+    scope: Literal["all", "graph", "kv"] = Field(
+        default="all",
+        description="What to clear: 'graph' for word/phrase/sentence graph, 'kv' for key-value memory, 'all' for both",
+    )
+    confirm: str = Field(
+        default="",
+        description="Safety token for clear operations. Must be exactly 'CONFIRM' to allow deletion.",
+    )
+
+
 class ImageSearchArgs(BaseModel):
     query: str = Field(description="Image search query")
     max_results: int = Field(default=3, description="Number of direct image URLs to return")
