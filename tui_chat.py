@@ -52,6 +52,12 @@ CLEAR_LINE = "\x1b[2K"
 CR = "\r"
 HIDE_CURSOR = "\x1b[?25l"
 SHOW_CURSOR = "\x1b[?25h"
+SAVE_CURSOR = "\x1b7"
+RESTORE_CURSOR = "\x1b8"
+
+# Global output lock so the spinner, the net-badge painter, and the main stream
+# never interleave escape sequences with each other.
+OUT_LOCK = threading.Lock()
 
 
 def _supports_color() -> bool:
@@ -66,6 +72,13 @@ def c(code: str) -> str:
 
 
 def _write(s: str) -> None:
+    with OUT_LOCK:
+        sys.stdout.write(s)
+        sys.stdout.flush()
+
+
+def _write_unlocked(s: str) -> None:
+    """For callers that already hold OUT_LOCK."""
     sys.stdout.write(s)
     sys.stdout.flush()
 
@@ -75,6 +88,94 @@ def _term_width(default: int = 80) -> int:
         return shutil.get_terminal_size((default, 24)).columns
     except Exception:
         return default
+
+
+# ---------- network status badge (top-right) ----------
+
+import socket  # placed here to keep the network block self-contained
+
+NET_PROBE_HOST = os.environ.get("RHEA_NET_HOST", "1.1.1.1")
+NET_PROBE_PORT = int(os.environ.get("RHEA_NET_PORT", "443"))
+NET_PROBE_INTERVAL = float(os.environ.get("RHEA_NET_INTERVAL", "5"))
+NET_PROBE_TIMEOUT = float(os.environ.get("RHEA_NET_TIMEOUT", "0.8"))
+
+
+class NetMonitor:
+    """
+    Pings a TCP host in a background thread and paints a small status badge
+    in the top-right corner of the terminal. Repaints only when the rendered
+    text changes (to avoid flicker), and coordinates with OUT_LOCK so it never
+    interleaves with the main stream or the spinner.
+    """
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_rendered = ""
+
+    def start(self) -> None:
+        if not COLOR:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        # wipe the badge area on exit
+        if COLOR:
+            self._paint("")
+
+    def _probe(self) -> tuple[str, str]:
+        """Return (label, color_key)."""
+        start = time.monotonic()
+        try:
+            with socket.create_connection((NET_PROBE_HOST, NET_PROBE_PORT), timeout=NET_PROBE_TIMEOUT):
+                pass
+        except Exception:
+            return ("offline", "br_red")
+        ms = int((time.monotonic() - start) * 1000)
+        if ms < 150:
+            return (f"{ms}ms", "br_green")
+        if ms < 400:
+            return (f"{ms}ms", "br_yellow")
+        return (f"{ms}ms", "br_red")
+
+    def _render(self, label: str, color_key: str) -> str:
+        glyph = "↯" if label != "offline" else "✗"
+        col = FG[color_key]
+        return f"{DIM}net {RESET}{col}{glyph} {label}{RESET}"
+
+    def _paint(self, rendered: str) -> None:
+        """
+        Paint `rendered` at row 1, right-aligned. Pass "" to clear.
+        Uses OUT_LOCK so the spinner/stream never overlaps.
+        """
+        width = _term_width()
+        # strip ANSI to measure visible length
+        visible = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+        col = max(1, width - len(visible))
+        # Build full sequence: save cursor, move to (1, col), clear to EOL, write, restore
+        seq = f"{SAVE_CURSOR}\x1b[1;{col}H\x1b[K{rendered}{RESTORE_CURSOR}"
+        with OUT_LOCK:
+            _write_unlocked(seq)
+
+    def _run(self) -> None:
+        # Paint a "probing" placeholder immediately so the slot is visible
+        self._paint(f"{DIM}net ↯ …{RESET}")
+        while not self._stop.is_set():
+            label, color_key = self._probe()
+            rendered = self._render(label, color_key)
+            # Always repaint: the badge lives at absolute row 1, and terminal
+            # scrolls will push it out of view otherwise. Row 1 is the top line
+            # (often the shell's own line above the TUI), so repainting it each
+            # interval is how it stays "pinned".
+            self._paint(rendered)
+            self._last_rendered = rendered
+            if self._stop.wait(NET_PROBE_INTERVAL):
+                break
 
 
 # ---------- URL detection + OSC 8 hyperlinks ----------
@@ -684,8 +785,12 @@ def main() -> None:
     parser.add_argument("prompt", nargs="*", help="Optional initial prompt to send immediately")
     args = parser.parse_args()
 
+    global _NET_MONITOR
     sess = Session()
     _print_banner(sess.session_id)
+
+    _NET_MONITOR = NetMonitor()
+    _NET_MONITOR.start()
 
     initial = " ".join(args.prompt).strip()
     if initial:
@@ -718,6 +823,9 @@ def main() -> None:
         _print_turn_separator()
 
 
+_NET_MONITOR: "NetMonitor | None" = None
+
+
 if __name__ == "__main__":
     try:
         main()
@@ -725,5 +833,7 @@ if __name__ == "__main__":
         _write(f"\n{c(DIM)}bye.{c(RESET)}\n")
         sys.exit(0)
     finally:
+        if _NET_MONITOR is not None:
+            _NET_MONITOR.stop()
         if COLOR:
             _write(SHOW_CURSOR)

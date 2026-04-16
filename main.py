@@ -1,5 +1,7 @@
 import asyncio
 import json
+import socket
+import time
 
 import httpx
 from fastapi import FastAPI
@@ -30,6 +32,24 @@ strategy = MinimalStyleStrategy()
 
 MAX_CONVERSATION_TURNS = 3
 _SESSION_HISTORY: dict[str, list[dict[str, str]]] = {}
+
+
+NET_PROBE_HOST = "1.1.1.1"
+NET_PROBE_PORT = 443
+NET_PROBE_TIMEOUT = 0.5
+
+
+def _probe_network() -> str:
+    """Return a short env string like 'online (42ms)' / 'slow (410ms)' / 'offline'."""
+    start = time.monotonic()
+    try:
+        with socket.create_connection((NET_PROBE_HOST, NET_PROBE_PORT), timeout=NET_PROBE_TIMEOUT):
+            pass
+    except Exception:
+        return "offline"
+    ms = int((time.monotonic() - start) * 1000)
+    label = "online" if ms < 200 else "slow"
+    return f"{label} ({ms}ms)"
 
 
 def _get_session_key(session_id: str | None) -> str:
@@ -98,6 +118,9 @@ async def chat(req: ChatRequest):
     system_prompt = strategy.build_system_prompt(tools)
 
     messages = [{"role": "system", "content": system_prompt}]
+
+    net_status = await asyncio.to_thread(_probe_network)
+    messages.append({"role": "system", "content": f"ENV: network={net_status}"})
 
     messages.append({"role": "system", "content": f"MEMORY: {memory_block}"})
     messages.extend(prior_history)
