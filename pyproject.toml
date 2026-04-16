@@ -9,4 +9,5 @@ dependencies = [
     "fastapi>=0.110",
     "httpx>=0.27",
     "uvicorn[standard]>=0.29",
+    "rich>=15.0.0",
 ]
