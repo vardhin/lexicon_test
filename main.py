@@ -23,7 +23,7 @@ from tools.memory import auto_memory_ingest, build_memory_context, ensure_memory
 from strategies.minimal_style import MinimalStyleStrategy
 
 LLAMA_URL = "http://localhost:8080/v1/chat/completions"
-MODEL_ID = "gemma-4-E4B-it-obliterated-Q4_K_M"
+MODEL_ID = "Abiray/gemma-4-E4B-it-OBLITERATED-GGUF:Q4_K_M"
 
 KEEPALIVE_INTERVAL = 4 * 60  # seconds between pings (must be < llama.cpp idle timeout)
 
